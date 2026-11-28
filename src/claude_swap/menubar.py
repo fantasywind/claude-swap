@@ -701,6 +701,78 @@ def framework_build_warning(
     )
 
 
+def format_artifact_status(
+    busy: bool,
+    progress,
+    cached_count: int,
+    auto_enabled: bool,
+) -> str:
+    """Single-line status text for the Artifacts submenu's header row."""
+    if busy:
+        if progress is None:
+            return "Syncing artifacts…"
+        phase = getattr(progress, "phase", "") or "sync"
+        cur = int(getattr(progress, "current", 0) or 0)
+        total = int(getattr(progress, "total", 0) or 0)
+        label = (getattr(progress, "label", "") or "").strip()
+        if len(label) > 22:
+            label = label[:21] + "…"
+        counter = f"{cur}/{total}" if total > 0 else "…"
+        suffix = f" · {label}" if label else ""
+        return f"Syncing [{phase} {counter}]{suffix}"
+    auto_text = "Auto: On" if auto_enabled else "Auto: Off"
+    return f"Synced: {cached_count} · {auto_text}"
+
+
+def format_artifact_notification(report) -> tuple[str, str]:
+    """Build ``(subtitle, message)`` for a macOS notification after sync/share."""
+    if report.expired_accounts:
+        who = ", ".join(report.expired_accounts)
+        return (
+            "Artifact sync — session expired",
+            f"Re-add claude.ai sessionKey for {who} (`cswap artifact add-session`).",
+        )
+    if report.errors and not (report.accepted or report.upgraded):
+        return ("Artifact sync failed", report.errors[0][:140])
+    parts: list[str] = []
+    if report.accepted:
+        parts.append(f"{report.accepted} accepted")
+    if report.upgraded:
+        parts.append(f"{report.upgraded} upgraded")
+    if report.already_synced:
+        parts.append(f"{report.already_synced} already synced")
+    body = ", ".join(parts) if parts else f"checked {report.artifacts_checked} artifact(s)"
+    if report.errors:
+        body += f" ({len(report.errors)} error(s))"
+    return ("Artifacts synced", body)
+
+
+def extract_clipboard_artifact_url(text: str) -> str:
+    """Return ``text`` stripped if it looks like a claude.ai artifact URL, else ''."""
+    s = (text or "").strip()
+    if not s or "claude.ai" not in s:
+        return ""
+    from claude_swap.artifact_sync import parse_artifact_ref
+
+    try:
+        parse_artifact_ref(s)
+        return s
+    except ValueError:
+        return ""
+
+
+def _read_clipboard_text() -> str:
+    """Best-effort macOS clipboard read via NSPasteboard (empty string on failure)."""
+    try:
+        import AppKit
+
+        pb = AppKit.NSPasteboard.generalPasteboard()
+        val = pb.stringForType_(AppKit.NSPasteboardTypeString)
+        return str(val) if val else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     try:
@@ -723,6 +795,7 @@ def run(switcher) -> int:
     # key on. Returns only when staying in this interpreter (already bundled,
     # opted out, framework build, or the bundle could not be built).
     app_bundle.maybe_reexec(switcher.backup_dir)
+    switcher._artifacts.background = True
     if not app_bundle.in_bundle():
         ensure_notification_identity()
     try:
@@ -784,6 +857,11 @@ def run(switcher) -> int:
             self._engine_errors_surfaced: dict[str, float] = {}
             self._health_item = None
             self._health_attention = False
+            self._artifact_lock = threading.Lock()
+            self._artifact_busy = False
+            self._artifact_progress = None
+            self._artifact_notice = None
+            self._artifact_status_item = None
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -826,6 +904,7 @@ def run(switcher) -> int:
                 self._dirty = True  # picked up by on_sync_tick on the main thread
                 if store_only:
                     self._snapshot_source.refresh_plans()
+                self.switcher._artifacts.maybe_sync_artifacts(snap.get("active"))
             finally:
                 self._refreshing = False
 
@@ -857,6 +936,7 @@ def run(switcher) -> int:
                 self.rebuild_menu()
             self._detect_active_change()
             self._drain_engine_events()
+            self._drain_artifact_events()
             self._refresh_health_row()
 
         def _health(self):
@@ -1082,6 +1162,7 @@ def run(switcher) -> int:
                 self._disable_menu(rumps),
                 self._remove_menu(rumps),
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
+                self._artifacts_menu(rumps),
                 self._history_menu(rumps),
                 None,
                 self._settings_menu(rumps),
@@ -1127,6 +1208,171 @@ def run(switcher) -> int:
                 item.state = 1 if disabled else 0
                 menu.add(item)
             return menu
+
+        def _artifacts_menu(self, rumps):
+            from claude_swap import artifact_sync as art
+            from claude_swap.settings import load_artifact_settings
+
+            root = self.switcher.backup_dir
+            art_settings = load_artifact_settings(root)
+            cached = art.ArtifactSyncState(root).summary()["count"]
+            with self._artifact_lock:
+                busy = self._artifact_busy
+                prog = self._artifact_progress
+
+            menu = rumps.MenuItem("Artifacts")
+            status_text = format_artifact_status(busy, prog, cached, art_settings.enabled)
+            status_item = rumps.MenuItem(status_text, callback=None)
+            self._artifact_status_item = status_item
+            menu.add(status_item)
+
+            expiring: list[str] = []
+            for acc in art.load_artifact_accounts(root):
+                if not acc.has_session():
+                    expiring.append(f"{acc.email or acc.slot} (missing)")
+                    continue
+                days = acc.days_until_expiry()
+                if days is not None and days <= 5:
+                    expiring.append(
+                        f"{acc.email} ({'expired' if days <= 0 else f'{days:.0f}d'})"
+                    )
+            if expiring:
+                menu.add(rumps.MenuItem(f"⚠ Sessions: {', '.join(expiring)}", callback=None))
+
+            menu.add(None)
+            menu.add(
+                rumps.MenuItem(
+                    "Sync recent artifacts (10)",
+                    callback=None if busy else self._make_sync_artifacts(10),
+                )
+            )
+            menu.add(
+                rumps.MenuItem(
+                    "Sync all recent artifacts (48)",
+                    callback=None if busy else self._make_sync_artifacts(48),
+                )
+            )
+            menu.add(
+                rumps.MenuItem(
+                    "Share artifact URL…",
+                    callback=None if busy else self.on_share_artifact,
+                )
+            )
+            menu.add(None)
+            auto_item = rumps.MenuItem("Auto-sync artifacts", callback=self.on_toggle_artifact_sync)
+            auto_item.state = 1 if art_settings.enabled else 0
+            menu.add(auto_item)
+            return menu
+
+        def _drain_artifact_events(self):
+            with self._artifact_lock:
+                busy = self._artifact_busy
+                prog = self._artifact_progress
+                notice, self._artifact_notice = self._artifact_notice, None
+
+            if busy and self._artifact_status_item is not None:
+                from claude_swap import artifact_sync as art
+                from claude_swap.settings import load_artifact_settings
+
+                root = self.switcher.backup_dir
+                text = format_artifact_status(
+                    True,
+                    prog,
+                    art.ArtifactSyncState(root).summary()["count"],
+                    load_artifact_settings(root).enabled,
+                )
+                if self._artifact_status_item.title != text:
+                    self._artifact_status_item.title = text
+
+            if notice is not None:
+                subtitle, message = notice
+                rumps.notification("claude-swap", subtitle, message)
+                self.rebuild_menu()
+
+        def _start_artifact_job(self, job_fn):
+            with self._artifact_lock:
+                if self._artifact_busy:
+                    return
+                self._artifact_busy = True
+                self._artifact_progress = None
+
+            self.rebuild_menu()
+
+            def _on_progress(ev):
+                with self._artifact_lock:
+                    self._artifact_progress = ev
+
+            def _worker():
+                try:
+                    rep = job_fn(_on_progress)
+                    notice = format_artifact_notification(rep)
+                except Exception as exc:  # noqa: BLE001
+                    self.switcher._logger.warning("menubar artifact job failed: %s", exc)
+                    notice = ("Artifact sync failed", str(exc)[:140])
+                finally:
+                    with self._artifact_lock:
+                        self._artifact_busy = False
+                        self._artifact_progress = None
+                with self._artifact_lock:
+                    self._artifact_notice = notice
+
+            threading.Thread(target=_worker, name="artifact-sync", daemon=True).start()
+
+        def _make_sync_artifacts(self, limit: int):
+            def cb(_sender):
+                from claude_swap import artifact_sync as art
+
+                root = self.switcher.backup_dir
+                self._start_artifact_job(
+                    lambda on_prog: art.sync_artifacts(
+                        root, limit=limit, on_progress=on_prog
+                    )
+                )
+            return cb
+
+        def on_share_artifact(self, _sender):
+            import AppKit
+            from claude_swap import artifact_sync as art
+
+            AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            default_url = extract_clipboard_artifact_url(_read_clipboard_text())
+            win = rumps.Window(
+                title="Share Claude Artifact",
+                message="Artifact URL, UUID, or Base58 slug (shared as editor to all other accounts):",
+                default_text=default_url,
+                ok="Share",
+                cancel="Cancel",
+                dimensions=(420, 24),
+            )
+            resp = win.run()
+            ref = (resp.text or "").strip() if resp.clicked == 1 else ""
+            if not ref:
+                return
+            try:
+                art.parse_artifact_ref(ref)
+            except ValueError as exc:
+                rumps.alert(title="claude-swap", message=str(exc))
+                return
+
+            root = self.switcher.backup_dir
+            active = self.snapshot.get("active")
+            self._start_artifact_job(
+                lambda on_prog: art.share_artifact(
+                    root,
+                    ref,
+                    active_slot=str(active) if active is not None else None,
+                    on_progress=on_prog,
+                )
+            )
+
+        def on_toggle_artifact_sync(self, _sender):
+            from claude_swap.settings import load_artifact_settings, set_artifact_sync_enabled
+
+            root = self.switcher.backup_dir
+            current = load_artifact_settings(root)
+            set_artifact_sync_enabled(root, not current.enabled)
+            self.switcher._artifacts.reload_settings()
+            self.rebuild_menu()
 
         def _history_menu(self, rumps):
             menu = rumps.MenuItem("Switch history")

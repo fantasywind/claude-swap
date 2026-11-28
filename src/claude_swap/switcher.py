@@ -496,6 +496,11 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
+        from claude_swap.artifact_sync import ArtifactSyncRunner
+        from claude_swap.settings import load_artifact_settings
+        self._artifacts = ArtifactSyncRunner(
+            load_artifact_settings(self.backup_dir), self.backup_dir
+        )
         # (settings mtimes, (threshold, weekly_threshold, models)) — see
         # _poll_policy_inputs.
         self._poll_inputs_cache: tuple[
@@ -8465,6 +8470,11 @@ class ClaudeAccountSwitcher:
             target_account,
             target_email,
             data["accounts"][target_account].get("organizationUuid", ""),
+        )
+        # Best-effort artifact sync for the outgoing account (opt-in, after
+        # locks release). Never affects the already-committed switch above.
+        self._artifacts.follow_switch(
+            outgoing_account=current_account, target_account=target_account
         )
         return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 

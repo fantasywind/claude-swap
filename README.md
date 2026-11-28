@@ -297,6 +297,10 @@ cswap menubar --foreground          # run attached to this terminal, for debuggi
 
 </details>
 
+### Artifact Sync (optional)
+
+Automatically invite your other managed accounts as editors on `claude.ai` artifacts and accept the invitations over HTTPS using each slot's `sessionKey` (`cswap artifact add-session` → `sync` / `share <url>` / `enable`), plus a dedicated *Artifacts* submenu in the macOS menu bar.
+
 ## Advanced
 
 ### Configuration

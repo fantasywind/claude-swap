@@ -979,3 +979,42 @@ def test_format_title_attention_prefix():
     assert menubar.format_title(None, None, settings, attention=True) == "⚠ ⇄"
     assert menubar.format_title("loc@papaya.asia", _USAGE, settings, attention=True).startswith("⚠ ⇄ ")
     assert not menubar.format_title("loc@papaya.asia", _USAGE, settings).startswith("⚠")
+
+
+def test_format_artifact_status_idle_and_busy():
+    from claude_swap.artifact_sync import ProgressEvent
+
+    assert menubar.format_artifact_status(False, None, 12, True) == "Synced: 12 · Auto: On"
+    assert menubar.format_artifact_status(False, None, 0, False) == "Synced: 0 · Auto: Off"
+    assert menubar.format_artifact_status(True, None, 0, True) == "Syncing artifacts…"
+
+    ev = ProgressEvent(phase="invite", account="a@x.com", current=3, total=10, label="Lilas UX 走查")
+    assert menubar.format_artifact_status(True, ev, 0, True) == "Syncing [invite 3/10] · Lilas UX 走查"
+
+    ev_list = ProgressEvent(phase="list", account="a@x.com", current=0, total=0, label="fetching artifacts")
+    assert menubar.format_artifact_status(True, ev_list, 0, True) == "Syncing [list …] · fetching artifacts"
+
+
+def test_format_artifact_notification_variants():
+    from claude_swap.artifact_sync import SyncReport
+
+    sub, body = menubar.format_artifact_notification(SyncReport(artifacts_checked=3, accepted=2, already_synced=1))
+    assert sub == "Artifacts synced"
+    assert "2 accepted" in body and "1 already synced" in body
+
+    sub_exp, body_exp = menubar.format_artifact_notification(SyncReport(expired_accounts=["b@x.com"]))
+    assert "expired" in sub_exp.lower()
+    assert "b@x.com" in body_exp
+
+    sub_err, body_err = menubar.format_artifact_notification(SyncReport(errors=["browser not running"]))
+    assert sub_err == "Artifact sync failed"
+    assert "browser not running" in body_err
+
+
+def test_extract_clipboard_artifact_url():
+    url = "https://claude.ai/artifact/1RQPLGDWF3VJSxMwK89UJe#page-5634c5cea0db"
+    assert menubar.extract_clipboard_artifact_url(f"  {url}\n") == url
+    chat_url = "https://claude.ai/chat/e829334a-12e1-4cf6-a3c4-8aa2bfcc30fd?artifact=03684313-ca04-4bc1-bc47-d8460e51013b"
+    assert menubar.extract_clipboard_artifact_url(chat_url) == chat_url
+    assert menubar.extract_clipboard_artifact_url("https://example.com/foo") == ""
+    assert menubar.extract_clipboard_artifact_url("random text") == ""

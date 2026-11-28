@@ -262,10 +262,13 @@ _AUTOSWITCH_KEYS: dict[str, str] = {
 # Every key the loaders read, per section. Anything else in the file is read
 # by nothing.
 _SECTION_KEYS: dict[str, tuple[str, ...]] = {
-    section: tuple(
-        spec.json_key for spec in SETTING_SPECS.values() if spec.section == section
-    )
-    for section in _SECTION_DEFAULT_SOURCES
+    **{
+        section: tuple(
+            spec.json_key for spec in SETTING_SPECS.values() if spec.section == section
+        )
+        for section in _SECTION_DEFAULT_SOURCES
+    },
+    "artifacts": ("enabled",),
 }
 
 # How alike two names must be (difflib ratio, compared without case) before
@@ -588,6 +591,32 @@ def load_usage_settings(backup_root: Path) -> UsageSettings:
             value = fallback
         values[field] = value
     return UsageSettings(**values)
+
+
+def load_artifact_settings(backup_root: Path):
+    """Load the ``artifacts`` section (optional cross-account artifact sync)."""
+    from claude_swap.artifact_sync import ArtifactSyncSettings
+
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("artifacts")
+    defaults = ArtifactSyncSettings()
+    if not isinstance(section, dict):
+        return defaults
+    value = section.get("enabled", defaults.enabled)
+    return ArtifactSyncSettings(enabled=value if isinstance(value, bool) else defaults.enabled)
+
+
+def set_artifact_sync_enabled(backup_root: Path, enabled: bool) -> None:
+    """Toggle ``artifacts.enabled`` in the active settings file, preserving other keys."""
+    path = settings_write_path(backup_root)
+    raw = _read_raw_for_write(path)
+    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+    section = raw.get("artifacts")
+    if not isinstance(section, dict):
+        section = {}
+    section["enabled"] = bool(enabled)
+    raw["artifacts"] = section
+    atomic_write_json(path, raw)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:

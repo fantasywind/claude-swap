@@ -8,6 +8,7 @@ import json
 import math
 import os
 import sys
+import time
 
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
@@ -1455,6 +1456,268 @@ def _menubar_service(args) -> int:
     return 0
 
 
+def _artifact_command(argv: list[str]) -> None:
+    """`cswap artifact <action>` — share claude.ai artifacts across managed accounts."""
+    import getpass
+    from claude_swap import artifact_sync as art
+    from claude_swap.settings import load_artifact_settings, set_artifact_sync_enabled
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} artifact",
+        description=(
+            "Optional: share claude.ai artifacts across managed accounts and "
+            "accept invitations over HTTPS using each account's sessionKey."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap artifact add-session                     # register a claude.ai sessionKey (prompts hidden input)
+  cswap artifact add-session - --account 2       # read sessionKey from stdin for slot 2
+  cswap artifact remove-session 2                # remove stored sessionKey for slot 2
+  cswap artifact status                          # session readiness, expiry, sync state
+  cswap artifact share <url|uuid|slug>           # share one artifact with all other accounts
+  cswap artifact sync --limit 10                 # sync recent owned artifacts across all accounts
+  cswap artifact enable | disable                # auto-sync on switch & menubar ticks
+  cswap artifact watch --interval 180            # foreground sync loop
+        """,
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    sub = parser.add_subparsers(
+        dest="action",
+        metavar="{status,add-session,remove-session,share,sync,watch,enable,disable}",
+    )
+    sub.add_parser("status", help="Show session readiness, expiry, and sync state")
+    sub.add_parser("doctor", help=argparse.SUPPRESS)
+
+    p_add = sub.add_parser("add-session", help="Register a claude.ai sessionKey cookie (verified via /api/account)")
+    p_add.add_argument("session_key", nargs="?", default=None, help="sessionKey value, '-' to read from stdin, or omit to prompt")
+    p_add.add_argument("--account", dest="account", default=None, help="Slot number or email (default: auto-match)")
+
+    p_rm = sub.add_parser("remove-session", help="Remove a stored claude.ai sessionKey")
+    p_rm.add_argument("account", help="Slot number or email")
+
+    p_share = sub.add_parser("share", help="Share a single artifact and accept on target accounts")
+    p_share.add_argument("artifact", help="Artifact URL (/artifact/<slug> or /chat/...?artifact=...), UUID, or slug")
+    p_share.add_argument("--from", dest="owner", default=None, help="Owner slot number or email (default: auto-detect)")
+    p_share.add_argument("--to", dest="targets", action="append", default=None, help="Target slot or email (repeatable; default: all other accounts)")
+    p_share.add_argument("--role", choices=art.VALID_ROLES, default=art.DEFAULT_ROLE, help="Collaborator role (default: editor)")
+
+    p_sync = sub.add_parser("sync", help="Sync owned artifacts across managed accounts")
+    p_sync.add_argument("--account", dest="owner", default=None, help="Sync only this owner slot or email (default: all accounts)")
+    p_sync.add_argument("--to", dest="targets", action="append", default=None, help="Target slot or email (repeatable; default: all other accounts)")
+    p_sync.add_argument("--role", choices=art.VALID_ROLES, default=art.DEFAULT_ROLE, help="Collaborator role (default: editor)")
+    p_sync.add_argument("--limit", type=int, default=art.DEFAULT_SYNC_LIMIT, help=f"Max recent artifacts per account (default: {art.DEFAULT_SYNC_LIMIT})")
+    p_sync.add_argument("--force", action="store_true", help="Ignore local cache and re-check all artifacts")
+
+    p_watch = sub.add_parser("watch", help="Run a foreground loop that periodically syncs artifacts")
+    p_watch.add_argument("--interval", type=float, default=art.PERIODIC_SYNC_INTERVAL_S, help="Seconds between sync passes (default: 180)")
+    p_watch.add_argument("--limit", type=int, default=art.SWITCH_SYNC_LIMIT, help="Max recent artifacts checked per account")
+
+    sub.add_parser("enable", help="Turn automatic artifact sync on (runs on switch & menubar ticks)")
+    sub.add_parser("disable", help="Turn automatic artifact sync off")
+
+    args = parser.parse_args(argv)
+    action = args.action or "status"
+
+    switcher = ClaudeAccountSwitcher(debug=args.debug)
+    if sys.platform != "win32":
+        if os.geteuid() == 0 and not switcher._is_running_in_container():
+            error("Error: Do not run this script as root (unless running in a container)")
+            sys.exit(1)
+    root = switcher.backup_dir
+    settings = load_artifact_settings(root)
+
+    if action == "enable":
+        set_artifact_sync_enabled(root, True)
+        print(f"{accent('Enabled')} automatic artifact sync.")
+        return
+    if action == "disable":
+        set_artifact_sync_enabled(root, False)
+        print(f"{accent('Disabled')} automatic artifact sync.")
+        return
+
+    if action in ("status", "doctor"):
+        print(accent("Claude Artifact sync"))
+        mark_on = accent("✓") if settings.enabled else dimmed("·")
+        print(f"  auto-sync:   {mark_on} {'enabled' if settings.enabled else 'disabled — run `cswap artifact enable`'}")
+        st = art.ArtifactSyncState(root).summary()
+        print(f"  cached:      {st['count']} artifact(s) synced")
+        print(accent("  sessions (per account):"))
+        accounts = art.load_artifact_accounts(root)
+        if not accounts:
+            print(f"    {dimmed('no managed accounts yet — run `cswap add`')}")
+        for acc in accounts:
+            if not acc.has_session():
+                print(f"    {dimmed('✗')} {acc.slot} {acc.email or '(unknown)'}  "
+                      f"{dimmed('→ run `cswap artifact add-session`')}")
+                continue
+            days = acc.days_until_expiry()
+            if days is None:
+                exp_hint = ""
+            elif days <= 0:
+                exp_hint = dimmed("  [sessionKey EXPIRED — re-add]")
+            elif days < 5:
+                exp_hint = dimmed(f"  [expires in {days:.1f}d]")
+            else:
+                exp_hint = dimmed(f"  [valid ~{int(days)}d]")
+            print(f"    {accent('✓')} {acc.slot} {acc.email} ({acc.org_uuid[:8]}…){exp_hint}")
+        return
+
+    if action == "add-session":
+        raw_key = args.session_key
+        if raw_key == "-":
+            raw_key = sys.stdin.read().strip()
+        elif raw_key is None:
+            try:
+                raw_key = getpass.getpass("claude.ai sessionKey cookie: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                sys.exit(1)
+        slot, detail = art.add_session_key(root, raw_key, slot_ref=args.account)
+        if slot is not None:
+            print(f"{accent('Stored')} claude.ai sessionKey for account {slot} ({detail})")
+            return
+        error(f"Could not store sessionKey: {detail}")
+        sys.exit(1)
+
+    if action == "remove-session":
+        accounts = art.load_artifact_accounts(root)
+        target = art.resolve_artifact_account(accounts, args.account)
+        slot = target.slot if target else args.account
+        if art.SessionVault(root).delete(slot):
+            print(f"{accent('Removed')} stored sessionKey for account {slot}")
+            return
+        error(f"No stored artifact sessionKey for account {args.account}")
+        sys.exit(1)
+
+    def _print_report(rep: art.SyncReport) -> None:
+        for item in rep.details:
+            title = f" ({item['title']})" if item.get("title") else ""
+            print(
+                f"  {accent('✓')} {item['action']} {item['role']}: "
+                f"{item['from']} → {item['to']} · {item['artifactId']}{title}"
+            )
+        summary = (
+            f"checked={rep.artifacts_checked}, accepted={rep.accepted}, "
+            f"upgraded={rep.upgraded}, already_synced={rep.already_synced}"
+        )
+        print(dimmed(f"Summary: {summary}"))
+        for em in rep.expired_accounts:
+            error(f"Session expired for {em} — re-register with `cswap artifact add-session`.")
+        for msg in rep.errors:
+            error(msg)
+
+    def _run_with_progress(fn):
+        if not sys.stderr.isatty():
+            return fn(None)
+        try:
+            from rich.console import Console
+            from rich.progress import (
+                BarColumn,
+                MofNCompleteColumn,
+                Progress,
+                SpinnerColumn,
+                TextColumn,
+                TimeElapsedColumn,
+            )
+        except ImportError:
+            return fn(None)
+
+        console = Console(stderr=True)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold]{task.fields[phase]:<6}[/bold]"),
+            TextColumn("{task.description}"),
+            BarColumn(bar_width=24),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TextColumn("[dim]{task.fields[item]}[/dim]"),
+            console=console,
+            transient=True,
+        ) as progress:
+            tasks: dict[tuple[str, str], int] = {}
+
+            def _on_progress(ev: art.ProgressEvent) -> None:
+                key = (ev.phase, ev.account)
+                item = ev.label[:28] + ("…" if len(ev.label) > 28 else "")
+                if ev.detail:
+                    item = f"{item} ({ev.detail})" if item else ev.detail
+                tid = tasks.get(key)
+                if tid is None:
+                    tid = progress.add_task(
+                        ev.account,
+                        total=ev.total if ev.total > 0 else None,
+                        completed=ev.current,
+                        phase=ev.phase,
+                        item=item,
+                    )
+                    tasks[key] = tid
+                else:
+                    progress.update(
+                        tid,
+                        total=ev.total if ev.total > 0 else None,
+                        completed=ev.current,
+                        item=item,
+                    )
+
+            return fn(_on_progress)
+
+    if action == "share":
+        seq = switcher._get_sequence_data() or {}
+        active = seq.get("activeAccountNumber")
+        try:
+            rep = _run_with_progress(
+                lambda cb: art.share_artifact(
+                    root,
+                    args.artifact,
+                    owner_ref=args.owner,
+                    target_refs=args.targets,
+                    role=args.role,
+                    active_slot=str(active) if active is not None else None,
+                    on_progress=cb,
+                )
+            )
+        except ValueError as exc:
+            error(str(exc))
+            sys.exit(1)
+        _print_report(rep)
+        if not rep.ok:
+            sys.exit(1)
+        return
+
+    if action == "sync":
+        try:
+            rep = _run_with_progress(
+                lambda cb: art.sync_artifacts(
+                    root,
+                    owner_ref=args.owner,
+                    target_refs=args.targets,
+                    role=args.role,
+                    limit=max(1, args.limit),
+                    force=args.force,
+                    on_progress=cb,
+                )
+            )
+        except ValueError as exc:
+            error(str(exc))
+            sys.exit(1)
+        _print_report(rep)
+        if not rep.ok:
+            sys.exit(1)
+        return
+
+    if action == "watch":
+        interval = max(15.0, float(args.interval))
+        print(f"{accent('Watching')} claude.ai artifacts every {int(interval)}s (Ctrl+C to stop)...")
+        try:
+            while True:
+                rep = art.sync_artifacts(root, limit=max(1, args.limit), force=False)
+                if rep.details or rep.errors or rep.expired_accounts:
+                    _print_report(rep)
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            return
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -1504,6 +1767,9 @@ def main() -> None:
         return
     if argv and argv[0] == "move":
         _move_command(argv[1:])
+        return
+    if argv and argv[0] in ("artifact", "artifacts"):
+        _artifact_command(argv[1:])
         return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
@@ -1558,6 +1824,7 @@ Commands:
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app, kept running by launchd
   %(prog)s menubar --service-status   is it running? does it start at login?
+  %(prog)s artifact [status|share|sync] share claude.ai artifacts across accounts
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 
